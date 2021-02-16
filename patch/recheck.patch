@@ -1,0 +1,138 @@
+diff -Nuarp linux-4.4.215.orig/include/net/netfilter/nf_conntrack.h linux-4.4.215/include/net/netfilter/nf_conntrack.h
+--- linux-4.4.215.orig/include/net/netfilter/nf_conntrack.h	2020-02-28 17:39:19.000000000 +0300
++++ linux-4.4.215/include/net/netfilter/nf_conntrack.h	2020-03-19 15:41:38.996850856 +0300
+@@ -111,6 +111,16 @@ struct nf_conn {
+ 	u_int32_t secmark;
+ #endif
+ 
++	/* Timer function; recheck connection that was accepted 
++	 * by xt_time extension in netfilter 
++	 */
++	struct timer_list xt_timeout;
++	struct list_head recheck_list;
++	uint16_t xt_time_diff;
++	uint16_t xt_status;
++	atomic_t timer_status;
++	atomic_t fwgenid;
++
+ 	/* Extensions */
+ 	struct nf_ct_ext *ext;
+ 
+diff -Nuarp linux-4.4.215.orig/include/net/netns/x_tables.h linux-4.4.215/include/net/netns/x_tables.h
+--- linux-4.4.215.orig/include/net/netns/x_tables.h	2020-02-28 17:39:19.000000000 +0300
++++ linux-4.4.215/include/net/netns/x_tables.h	2020-03-10 19:43:10.181013067 +0300
+@@ -3,6 +3,7 @@
+ 
+ #include <linux/list.h>
+ #include <linux/netfilter_defs.h>
++#include <linux/types.h>
+ 
+ struct ebt_table;
+ 
+@@ -10,6 +11,7 @@ struct netns_xt {
+ 	struct list_head tables[NFPROTO_NUMPROTO];
+ 	bool notrack_deprecated_warning;
+ 	bool clusterip_deprecated_warning;
++	atomic_t filter_table_genid;
+ #if defined(CONFIG_BRIDGE_NF_EBTABLES) || \
+     defined(CONFIG_BRIDGE_NF_EBTABLES_MODULE)
+ 	struct ebt_table *broute_table;
+diff -Nuarp linux-4.4.215.orig/net/ipv4/netfilter/iptable_filter.c linux-4.4.215/net/ipv4/netfilter/iptable_filter.c
+--- linux-4.4.215.orig/net/ipv4/netfilter/iptable_filter.c	2020-02-28 17:39:19.000000000 +0300
++++ linux-4.4.215/net/ipv4/netfilter/iptable_filter.c	2020-03-10 19:45:27.955999178 +0300
+@@ -64,6 +64,9 @@ static int __net_init iptable_filter_net
+ 
+ 	net->ipv4.iptable_filter =
+ 		ipt_register_table(net, &packet_filter, repl);
++	if (!IS_ERR(net->ipv4.iptable_filter))
++		atomic_set(&net->xt.filter_table_genid, 0);
++
+ 	kfree(repl);
+ 	return PTR_ERR_OR_ZERO(net->ipv4.iptable_filter);
+ }
+diff -Nuarp linux-4.4.215.orig/net/ipv4/netfilter/ip_tables.c linux-4.4.215/net/ipv4/netfilter/ip_tables.c
+--- linux-4.4.215.orig/net/ipv4/netfilter/ip_tables.c	2020-02-28 17:39:19.000000000 +0300
++++ linux-4.4.215/net/ipv4/netfilter/ip_tables.c	2020-03-10 19:45:45.262997434 +0300
+@@ -1307,6 +1307,10 @@ do_replace(struct net *net, const void _
+ 			   tmp.num_counters, tmp.counters);
+ 	if (ret)
+ 		goto free_newinfo_untrans;
++	
++	if (tmp.name[0] == 'f') /* only filter table is supported */
++		atomic_inc(&net->xt.filter_table_genid);
++
+ 	return 0;
+ 
+  free_newinfo_untrans:
+diff -Nuarp linux-4.4.215.orig/net/netfilter/nf_conntrack_core.c linux-4.4.215/net/netfilter/nf_conntrack_core.c
+--- linux-4.4.215.orig/net/netfilter/nf_conntrack_core.c	2020-02-28 17:39:19.000000000 +0300
++++ linux-4.4.215/net/netfilter/nf_conntrack_core.c	2020-03-12 15:59:35.175957214 +0300
+@@ -445,6 +445,10 @@ bool nf_ct_delete(struct nf_conn *ct, u3
+ 		return false;
+ 	}
+ 
++	/* stop timer and drop the extra ref */
++	if (del_timer(&ct->xt_timeout))
++		ct->xt_timeout.function((unsigned long)ct);
++
+ 	nf_conntrack_ecache_work(nf_ct_net(ct));
+ 	set_bit(IPS_DYING_BIT, &ct->status);
+  delete:
+@@ -905,6 +909,9 @@ __nf_conntrack_alloc(struct net *net,
+ 	if (zone && nf_ct_zone_add(ct, GFP_ATOMIC, zone) < 0)
+ 		goto out_free;
+ 
++	atomic_set(&ct->fwgenid, 0);
++	atomic_set(&ct->timer_status, 0);
++
+ 	/* Because we use RCU lookups, we set ct_general.use to zero before
+ 	 * this is inserted in any list.
+ 	 */
+diff -Nuarp linux-4.4.215.orig/net/netfilter/xt_time.c linux-4.4.215/net/netfilter/xt_time.c
+--- linux-4.4.215.orig/net/netfilter/xt_time.c	2020-02-28 17:39:19.000000000 +0300
++++ linux-4.4.215/net/netfilter/xt_time.c	2020-03-19 15:42:39.576850307 +0300
+@@ -15,6 +15,7 @@
+ #include <linux/types.h>
+ #include <linux/netfilter/x_tables.h>
+ #include <linux/netfilter/xt_time.h>
++#include <net/netfilter/nf_conntrack.h>
+ 
+ struct xtm {
+ 	u_int8_t month;    /* (1-12) */
+@@ -151,6 +152,18 @@ static void localtime_3(struct xtm *r, t
+ 	r->month    = i + 1;
+ }
+ 
++static void time_update_ct(const struct sk_buff *skb, unsigned int diff)
++{
++	struct nf_conn *ct;
++	enum ip_conntrack_info ctinfo;
++
++	ct = nf_ct_get(skb, &ctinfo);
++	if (!ct)
++		return;
++	
++	ct->xt_time_diff = diff;
++}
++
+ static bool
+ time_mt(const struct sk_buff *skb, struct xt_action_param *par)
+ {
+@@ -226,6 +239,17 @@ time_mt(const struct sk_buff *skb, struc
+ 			return false;
+ 	}
+ 
++	if (info->daytime_start < info->daytime_stop) {
++		time_update_ct(skb, info->daytime_stop - packet_time);
++	} else {
++		unsigned int diff;
++		if (packet_time > info->daytime_start)
++			diff = info->daytime_stop + (SECONDS_PER_DAY - packet_time);
++		else
++			diff = info->daytime_stop - packet_time;
++		time_update_ct(skb, diff);
++	}
++
+ 	return true;
+ }
+ 
